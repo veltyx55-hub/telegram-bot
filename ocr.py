@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import io
+import gc
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 import zipfile
@@ -30,9 +33,24 @@ from stats import main_menu_markup, main_menu_text
 
 
 LANGUAGES = {
-    "korean": {"label": "🇰🇷 Korea", "paddle": "korean", "display": "Korean"},
-    "english": {"label": "🇬🇧 English", "paddle": "en", "display": "English"},
-    "spanish": {"label": "🇪🇸 Spanish", "paddle": "es", "display": "Spanish"},
+    "korean": {
+        "label": "🇰🇷 Korea",
+        "paddle": "korean",
+        "recognition_model": "korean_PP-OCRv5_mobile_rec",
+        "display": "Korean",
+    },
+    "english": {
+        "label": "🇬🇧 English",
+        "paddle": "en",
+        "recognition_model": "en_PP-OCRv5_mobile_rec",
+        "display": "English",
+    },
+    "spanish": {
+        "label": "🇪🇸 Spanish",
+        "paddle": "es",
+        "recognition_model": "latin_PP-OCRv5_mobile_rec",
+        "display": "Spanish",
+    },
 }
 
 SUPPORTED_IMAGE_EXTENSIONS = {
@@ -67,7 +85,11 @@ KNOWN_SFX = {
     "ZAP",
 }
 
-_ocr_engines: dict[str, Any] = {}
+# Keep only one language model alive. On a 500 MB container, retaining Korean,
+# English, and Spanish engines after users switch languages can trigger OOM.
+_ocr_engine: Any | None = None
+_ocr_engine_language: str | None = None
+_ocr_lock = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -181,8 +203,10 @@ def _safe_extract_images(
         if destination_resolved not in output_path.parents:
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Stream the member instead of creating a second in-memory copy of a
+        # potentially large comic page.
         with archive.open(member) as source, output_path.open("wb") as target:
-            target.write(source.read())
+            shutil.copyfileobj(source, target, length=1024 * 1024)
 
         # The first folder in the archive is the chapter folder. This works
         # for Chapter 01/01.jpg and also for Chapter 01/pages/01.jpg.
@@ -202,8 +226,10 @@ def _safe_extract_images(
 
 
 def _get_ocr_engine(language_key: str) -> Any:
-    if language_key in _ocr_engines:
-        return _ocr_engines[language_key]
+    global _ocr_engine, _ocr_engine_language
+
+    if _ocr_engine is not None and _ocr_engine_language == language_key:
+        return _ocr_engine
 
     _load_openmp_runtime()
     try:
@@ -213,16 +239,24 @@ def _get_ocr_engine(language_key: str) -> Any:
             "PaddleOCR belum terpasang. Jalankan instalasi dari requirements.txt."
         ) from error
 
-    paddle_language = LANGUAGES[language_key]["paddle"]
+    language = LANGUAGES[language_key]
+    paddle_language = language["paddle"]
     try:
-        # PaddleOCR 3.x: disable optional document classifiers so manga page
-        # OCR stays focused on text recognition and works on CPU.
+        # PaddleOCR 3.x. Explicit mobile models avoid the default medium
+        # detector/recognizer (PP-OCRv6_medium_*), which is too large for
+        # Railway's ~500 MB limit. The language-specific mobile recognizers
+        # preserve Korean, English, and Spanish support.
         engine = PaddleOCR(
             lang=paddle_language,
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name=language["recognition_model"],
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
             enable_mkldnn=False,
+            device="cpu",
+            text_recognition_batch_size=1,
+            text_det_limit_side_len=960,
         )
     except (TypeError, ValueError):
         # Compatibility with PaddleOCR 2.x installations.
@@ -232,7 +266,13 @@ def _get_ocr_engine(language_key: str) -> Any:
             use_gpu=False,
         )
 
-    _ocr_engines[language_key] = engine
+    # Release a previous language engine before retaining the new one. The
+    # lock in _recognize_page prevents this from happening during inference.
+    if _ocr_engine is not None:
+        del _ocr_engine
+        gc.collect()
+    _ocr_engine = engine
+    _ocr_engine_language = language_key
     return engine
 
 
@@ -288,12 +328,15 @@ def _texts_from_paddle_result(result: Any) -> list[str]:
 
 
 def _recognize_page(image_path: Path, language_key: str) -> list[str]:
-    engine = _get_ocr_engine(language_key)
+    # Paddle inference is CPU-bound; serializing it also prevents two users
+    # from loading/using separate model graphs at the same time.
+    with _ocr_lock:
+        engine = _get_ocr_engine(language_key)
 
-    if hasattr(engine, "predict"):
-        result = engine.predict(str(image_path))
-    else:
-        result = engine.ocr(str(image_path), cls=False)
+        if hasattr(engine, "predict"):
+            result = engine.predict(str(image_path))
+        else:
+            result = engine.ocr(str(image_path), cls=False)
 
     return _texts_from_paddle_result(result)
 
