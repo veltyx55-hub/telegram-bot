@@ -1,1 +1,5 @@
 python-telegram-bot
+paddleocr
+paddlepaddle
+Pillow
+python-docx
